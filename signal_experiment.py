@@ -268,18 +268,18 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
         #print(params)
         return params
 
-    def dists(self, params, batches):
-        dists = []
-        for k in range(self.signal_length):
-            s_dists = []
-            for j in range(self.meaning_sz):
-                m_dist = []
-                for i in range(self.articulator_dim):
-                    mx_beta = torch.distributions.Beta(params[k][j][2 * i], params[k][j][2 * i + 1])
-                    m_dist.append(mx_beta)
-                s_dists.append(m_dist)
-            dists.append(s_dists) # S x B (or M) x Articulator Dim
-        return dists
+    def dists(self, params):
+        # dists = []
+        # for k in range(self.signal_length):
+        #     s_dists = []
+        #     for j in range(self.meaning_sz):
+        #         m_dist = []
+        #         for i in range(self.articulator_dim):
+        #             mx_beta = torch.distributions.Beta(params[k][j][2 * i], params[k][j][2 * i + 1])
+        #             m_dist.append(mx_beta)
+        #         s_dists.append(m_dist)
+        #     dists.append(s_dists)                                                       # S x B (or M) x Articulator Dim
+        return torch.distributions.Beta(params[:, :, self.articulator_dim:],params[:, :, :self.articulator_dim])
 
     def decoder(self, signals):
         h0, c0 = self.get_decoder_initial_state(len(signals[0,:,0].squeeze()))
@@ -290,12 +290,7 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
         return y_hat
 
     def sample_x(self, dists, batches):
-        x = []
-        for i in range(batches):
-            x.append(torch.stack([torch.stack([torch.stack([dist.rsample() for dist in s_dists]) for s_dists in m_dists]) for m_dists in dists]))
-        signals = torch.cat(x, dim=-2)
-        #print(signals)
-        return signals
+        return torch.cat([dists.rsample() for _ in range(batches)], dim = -2)
 
     def forward(self, ms, batches):
         """
@@ -307,7 +302,7 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
         """
 
         params = self.encoder(ms)
-        dists = self.dists(params, batches)
+        dists = self.dists(params)
         signals = self.sample_x(dists, batches)
         signals = signals.to(ms.device)
         y_hat = self.decoder(signals)
