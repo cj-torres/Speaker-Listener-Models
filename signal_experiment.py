@@ -1,4 +1,4 @@
-import torch
+import torch, pyro, csv, math
 import matplotlib.pyplot as plot
 import sys
 import pyro
@@ -6,6 +6,7 @@ from typing import Sequence
 import GaussianLSTM as gl
 from rfutils import sliding
 
+LOG2 = math.log(2)
 
 class PyroSimpleSpeakerListener(pyro.nn.PyroModule):
     """
@@ -264,7 +265,7 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
         lstm_input = torch.stack([embed]*self.signal_length,dim=0)                      # S x B x H
         h0, c0 = self.get_encoder_initial_state(len(x))
         lstm_output, _ = self.encoder_lstm(lstm_input, (h0, c0))
-        params = torch.nn.functional.softplus(lstm_output @ self.parameter_transform)   # S x B x P
+        params = torch.nn.functional.softplus(lstm_output @ self.parameter_transform).clamp(min=1e-8,max=1e8)
         #print(params)
         return params
 
@@ -309,6 +310,14 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
 
         return y_hat
 
+    def mi_for_my(self, m, y_hat, batches):
+        #n = len(m)/self.meaning_sz
+        y_given_x = y_hat[torch.nn.functional.one_hot(m, self.meaning_sz).to(torch.bool)]
+        #print(y_given_x)
+        py = torch.cat([y_hat.mean(dim=0)]*batches)
+        #print(py)
+        return ((y_given_x * (1/self.meaning_sz) * ((y_given_x / py).log())).sum()/LOG2)/batches  #/batches
+
     def train(self, epochs, print_every = 10, batches = 50):
         self.to("cuda")
         ce = torch.nn.CrossEntropyLoss().to("cuda")
@@ -317,15 +326,30 @@ class PyroSimpleSpeakerListenerLSTM(torch.nn.Module):
 
         optimizer = torch.optim.Adam(self.parameters(), lr=.001)
 
+        best_loss = torch.tensor([float('inf')]).squeeze()
+        early_stop_counter = 0
+        #with torch.autograd.detect_anomaly():
         for i in range(epochs):
             optimizer.zero_grad()
             y_hat = self(ms_in, batches)
             loss = ce(y_hat, ms)
+            #neg_loss = -loss #= ce(y_hat, ms)
             loss.backward()
             optimizer.step()
 
             if (i % print_every) == 0:
-                print(loss)
+                mi = self.mi_for_my(ms, y_hat, batches)
+                print("Mutual Information on epoch %d: %s" % (i, mi.item()))
+
+            if loss >= best_loss:
+                early_stop_counter += 1
+                if early_stop_counter > 9:
+                    break
+            else:
+                best_loss = loss
+                early_stop_counter = 0
+
+        return self.mi_for_my(ms, y_hat, batches).item()
 
 
 def cross_add(tensor1: torch.Tensor, tensor2: torch.Tensor):
@@ -333,6 +357,7 @@ def cross_add(tensor1: torch.Tensor, tensor2: torch.Tensor):
     This simple function does outer addition, outer multiplication in log space
     """
     return tensor1 + torch.transpose(tensor2.repeat(tensor1[...,None].size()), dim0=0, dim1=-1)
+
 
 
 def train_simple_model(meanings: int, articulator_dim: int, embedding_sz: int, hidden_sz: int, epochs: int):
@@ -347,6 +372,8 @@ def train_simple_model(meanings: int, articulator_dim: int, embedding_sz: int, h
         if i % 10 == 0:
             print("MI loss: " + str(-loss.item()))
 
+
+
     model.show_tensors()
 
     return model
@@ -357,3 +384,18 @@ def visualize_tensor(array: torch.Tensor, i: int):
     plot.savefig("figures\\figure_%s.png" % str(i))
     plot.show(block=False)
 
+def grid_search():
+    with open('sl_grid.csv', 'w', newline='') as model_file:
+        model_writer = csv.writer(model_file)
+        model_writer.writerow(["meanings", "signal length", "signal dimension", "MI", "theoretical best"])
+        meanings = [4, 8, 16, 32, 64]
+        signal_lengths = [1, 2, 3, 4, 5]
+        signal_dims = [1, 2, 3]
+        for meaning in meanings:
+            theoretical_best = math.log(meaning)/math.log(2)
+            for signal_length in signal_lengths:
+                for signal_dim in signal_dims:
+                    model = PyroSimpleSpeakerListenerLSTM(meaning,signal_dim,16,40,40,1,signal_length)
+                    mi = model.train(10000, batches = 1024)
+
+                    model_writer.writerow([meaning,signal_length,signal_dim,mi,theoretical_best])
